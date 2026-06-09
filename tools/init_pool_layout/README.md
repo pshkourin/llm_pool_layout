@@ -1,8 +1,8 @@
 # init_pool_layout.sh
 
-Generates a directory tree compliant with the **`pool_layout_v1`** specification — a
-shared, format-first filesystem layout for LLM artifacts on hosts that may run
-multiple inference engines.
+Generates a directory tree compliant with the **`pool_layout_v1`** specification —
+a shared, format-first filesystem layout for LLM artifacts on hosts that may run
+multiple inference engines. The whole layout is built under one base directory.
 
 ---
 
@@ -10,80 +10,62 @@ multiple inference engines.
 
 ## What it builds
 
+Given `--path /opt/revolver/llm-pool`, the base directory itself is the
+**pool-root**, and the three roots are created inside it:
+
 ```
-<pool-root>/
-├── artifacts/        canonical, immutable, format-first   (read-only to runtimes)
+/opt/revolver/llm-pool/          ← pool-root / trust boundary
+├── artifacts/                   canonical, immutable, format-first  (read-only to runtimes)
 │   ├── gguf/
 │   ├── safetensors/
 │   ├── awq/  gptq/  mlx/  onnx/
 │   └── <format>/<publisher>/<model>/<file>
-├── cache/            writable, disposable runtime data
-└── staging/          writable import workspace
-    └── jobs/<job-id>/
+├── cache/                       writable, disposable runtime data
+└── staging/                     writable import workspace
+    └── jobs/
 ```
 
-Canonical artifact path: `<artifacts-root>/<format>/<publisher>/<model>/<file>`
+Canonical artifact path: `<path>/artifacts/<format>/<publisher>/<model>/<file>`
+
+## Parameters
+
+| Parameter | Required | Meaning |
+|-----------|----------|---------|
+| `--path </path/to/dir>` | yes | Base directory. The script builds `artifacts/`, `cache/`, and `staging/` inside it; the directory itself becomes pool-root. |
+| `--owner <GID \| groupname>` | no | Group that owns the created directories. Enables the shared-library permission model (setgid, group-writable). The group must already exist. |
+| `-h`, `--help` | no | Show usage. |
 
 ## Run it
 
 ```bash
-# rootless defaults under $HOME
-./init_pool_layout.sh
+# minimal: just build the tree (single owner, no group sharing)
+bash init_pool_layout.sh --path /opt/revolver/llm-pool
 
-# system-managed defaults (/srv, /usr/share, /var/cache, /var/lib)
-./init_pool_layout.sh --system
+# shared library owned by group "revolver" (run as root to apply chown)
+bash init_pool_layout.sh --path /opt/revolver/llm-pool --owner revolver
 
-# build into a throwaway sandbox without touching real paths
-./init_pool_layout.sh --prefix /tmp/sandbox --example
-
-# explicit paths + shared-library ownership (run as root to apply chown)
-sudo POOL_ROOT=/opt/revolver \
-  ARTIFACTS_ROOT=/opt/revolver/artifacts \
-  CACHE_ROOT=/opt/revolver/cache \
-  STAGING_ROOT=/opt/revolver/staging \
-  bash init_pool_layout.sh --owner revolver
+# the group may also be given by GID
+bash init_pool_layout.sh --path /opt/revolver/llm-pool --owner 2000
 ```
 
-## Flags
-
-| Flag | Effect |
-|------|--------|
-| `--rootless` | Defaults under `$HOME` (default profile) |
-| `--system` | System-managed defaults (`/srv`, `/usr/share`, `/var/cache`, `/var/lib`) |
-| `--prefix PATH` | Prepend a sandbox prefix to every root (for testing; skips `chown`) |
-| `--example` | Also create the minimal example payloads + `_pool.json` metadata |
-| `--owner GROUP` | Apply the shared-library permission model (setgid, group-writable). **Implies `--system` unless a profile is set explicitly.** |
-| `--artifacts-user USER` | Owner user for `artifacts`/`pool-root` (default `root`) |
-| `--cache-user USER` | Owner user for `cache`/`staging` (default = group name) |
-| `-h`, `--help` | Show usage |
-
-### Profile selection
-
-The profile decides the default paths. It resolves in this order:
-
-1. An explicit `--rootless` / `--system` flag always wins.
-2. Otherwise, `--owner GROUP` implies `--system` (a shared group library is a
-   system-managed scenario, not a per-user one).
-3. Otherwise, the default is `rootless`.
-
-In all cases the `*_ROOT` environment variables override the profile's paths,
-so if you pass explicit roots the profile only affects the banner, not the
-locations.
-
-## Environment overrides (win over the profile)
-
-`POOL_ROOT`, `ARTIFACTS_ROOT`, `CACHE_ROOT`, `STAGING_ROOT`, `PRODUCT`, `SVC`
+No environment variables, no `sudo VAR=...` tricks — paths and ownership are
+passed directly as arguments, so copy-paste works the same under root, under
+`sudo`, or as a normal user.
 
 ## Permission models
 
-| Mode | artifacts / pool-root | cache / staging |
-|------|----------------------|-----------------|
-| default (no `--owner`) | `0755`, owner-writable | `0700`, owner-only |
-| `--owner GROUP` | `<artifacts-user>:GROUP` `2775` | `<cache-user>:GROUP` `2770` |
+| Mode | pool-root / artifacts | cache / staging |
+|------|-----------------------|-----------------|
+| no `--owner` | `0755` (world-readable, owner-writable) | `0700` (owner-only) |
+| `--owner GROUP` | `root:GROUP` `2775` | `:GROUP` `2770` |
 
 The leading `2` is **setgid**: new files and subdirectories inherit the group,
 so every member of `GROUP` can publish into the shared library and the group
 stays consistent.
+
+If `--owner` is given but the script is **not** running as root, the directory
+**modes** are still set, but the `chown` is skipped — the script prints the exact
+`chown` commands to run as root.
 
 ## ⚠️ One thing not to forget
 
@@ -95,9 +77,10 @@ files after publication.
 
 ## Filesystem tip
 
-Keep `staging` on the **same filesystem** as `artifacts`. Then publication is a
-fast atomic `rename()` and imports can hardlink instead of copying. A dedicated
-mount (e.g. `mount /dev/nvme1n1 /opt/revolver` with all roots underneath) gives
+`artifacts` and `staging` live under the same `--path`, so they are on the same
+filesystem by construction: publication is a fast atomic `rename()` and imports
+can hardlink instead of copying. A dedicated mount (e.g.
+`mount /dev/nvme1n1 /opt/revolver` with `--path /opt/revolver/llm-pool`) gives
 you this for free.
 
 ---
@@ -124,24 +107,25 @@ to avoid exactly that.
 
 ## The four roots
 
-Everything rests on separating four concerns that are easy to conflate:
+Everything rests on separating four concerns that are easy to conflate. In this
+version they all descend from the single `--path` base:
 
-- **`pool-root`** — the administrative root and the **trust boundary** for path
-  resolution. It groups the roots of one pool instance. It may be a real
-  directory or a logical umbrella over several absolute paths. It does *not*
-  hold model payloads itself.
-- **`artifacts-root`** — the *only* canonical, durable home for published model
-  payloads. Treated as **immutable** and mounted read-only into runtimes.
-- **`cache-root`** — writable, disposable runtime state (prompt caches, compiled
-  kernels, indices, download caches). A runtime must survive cache loss, modulo
-  regeneration cost.
-- **`staging-root`** — the writable workspace where downloads, conversions, and
-  validation happen *before* publication. A failed import stays here and never
-  contaminates the published tree.
+- **pool-root** (`<path>`) — the administrative root and the **trust boundary**
+  for path resolution. It groups the roots of one pool instance. It does *not*
+  hold model payloads directly.
+- **artifacts-root** (`<path>/artifacts`) — the *only* canonical, durable home
+  for published model payloads. Treated as **immutable** and mounted read-only
+  into runtimes.
+- **cache-root** (`<path>/cache`) — writable, disposable runtime state (prompt
+  caches, compiled kernels, indices, download caches). A runtime must survive
+  cache loss, modulo regeneration cost.
+- **staging-root** (`<path>/staging`) — the writable workspace where downloads,
+  conversions, and validation happen *before* publication. A failed import stays
+  here and never contaminates the published tree.
 
 ## Format-first, not runtime-first
 
-The top-level taxonomy under `artifacts-root` is the **artifact format**
+The top-level taxonomy under `artifacts` is the **artifact format**
 (`gguf/`, `safetensors/`, `awq/`, `gptq/`, `mlx/`, `onnx/`), never a runtime
 name. Format is more stable than runtime attachment: one model can serve several
 runtimes, and one runtime supports several formats across releases. Format-first
@@ -151,7 +135,7 @@ instead of forcing a storage migration.
 ## The path shape
 
 ```
-<artifacts-root>/<format>/<publisher>/<model>/<file>
+<path>/artifacts/<format>/<publisher>/<model>/<file>
 ```
 
 This mirrors how model ecosystems already think — `publisher/model` is the
@@ -163,10 +147,10 @@ sit together without inventing synthetic runtime folders.
 ## Why publication is a ritual, not a copy
 
 Imports are messy: downloads fail halfway, conversions produce garbage,
-validation rejects candidates. So nothing is written directly into
-`artifacts-root`. Instead:
+validation rejects candidates. So nothing is written directly into `artifacts`.
+Instead:
 
-1. Land incoming files in a job directory under `staging-root/jobs/<job-id>/`.
+1. Land incoming files in a job directory under `staging/jobs/<job-id>/`.
 2. Validate structure, names, sizes, checksums.
 3. Derive the canonical destination path.
 4. **Publish atomically** (`rename()` on the same filesystem).
@@ -182,8 +166,8 @@ silent content swaps under the same identity.
 Both are allowed as optimizations but constrained, because in a shared pool they
 are the easiest way to break the trust boundary:
 
-- **Symlinks** must resolve *inside* the pool boundary — never into `cache-root`,
-  `staging-root`, or unrelated host paths. Relative, file-level symlinks are
+- **Symlinks** must resolve *inside* the pool boundary — never into `cache`,
+  `staging`, or unrelated host paths. Relative, file-level symlinks are
   preferred; directory symlinks for canonical model dirs are discouraged.
 - **Hardlinks** are great for same-filesystem dedup, but a hardlinked published
   file shares an inode with its source — safe *only* under strict immutability.
