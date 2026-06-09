@@ -2,125 +2,99 @@
 #
 # init_pool_layout.sh
 #
-# Generates a directory tree compliant with the pool_layout_v1 specification.
+# Generates a directory tree compliant with the pool_layout_v1 specification,
+# rooted at a single base directory.
 #
-# Layout model:
-#   pool-root      administrative root / trust boundary
-#   artifacts-root canonical, immutable, format-first published payloads
-#                  (mounted read-only into runtimes)
-#   cache-root     writable, disposable runtime data
-#   staging-root   writable working area for imports before publication
+# Layout produced (pool-root = the --path directory):
+#   <path>/                       pool-root / trust boundary
+#   <path>/artifacts/             canonical, immutable, format-first payloads
+#       gguf/ safetensors/ awq/ gptq/ mlx/ onnx/
+#   <path>/cache/                 writable, disposable runtime data
+#   <path>/staging/jobs/          writable import workspace
 #
 # Canonical artifact path shape:
-#   <artifacts-root>/<format>/<publisher>/<model>/<file>
+#   <path>/artifacts/<format>/<publisher>/<model>/<file>
 #
-# Usage:
-#   ./init_pool_layout.sh                 # rootless defaults under $HOME
-#   ./init_pool_layout.sh --system        # system-managed defaults
-#   ./init_pool_layout.sh --prefix /tmp/p # build the tree under a sandbox prefix
-#   ./init_pool_layout.sh --example       # also create the minimal example contents
+# Parameters:
+#   --path  </path/to/dir>     base directory to build the layout in (required)
+#   --owner <GID | groupname>  group that owns the created directories (optional)
 #
-# Environment overrides (take precedence over the chosen profile):
-#   POOL_ROOT, ARTIFACTS_ROOT, CACHE_ROOT, STAGING_ROOT
+# Permission model (spec section 11):
+#   without --owner:
+#       artifacts  0755   (world-readable, owner-writable)
+#       cache      0700   (owner-only)
+#       staging    0700   (owner-only)
+#   with --owner GROUP (shared library):
+#       artifacts  root:GROUP   2775   (setgid, group-writable)
+#       cache      GROUP            2770   (setgid, group-writable)
+#       staging    GROUP            2770   (setgid, group-writable)
+#   setgid (leading 2) makes new files/dirs inherit the group, so any member
+#   of GROUP can publish and the group stays consistent.
+#
+# NOTE: with --owner, group-write means filesystem permissions do NOT enforce
+# artifact immutability (spec 7.4) — that relies on the import workflow
+# (stage first, publish with an atomic rename, never rewrite a published file).
 #
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
-# Defaults / argument parsing
+# Parameters
 # ---------------------------------------------------------------------------
-PROFILE="rootless"     # rootless | system
-PROFILE_EXPLICIT=0     # set to 1 when --rootless/--system is passed explicitly
-PREFIX=""              # optional sandbox prefix prepended to every root
-MAKE_EXAMPLE=0
-PRODUCT="${PRODUCT:-myproduct}"
-SVC="${SVC:-$(id -un)}"
-
-# Ownership model (set via --owner GROUP). When OWNER_GROUP is non-empty the
-# script applies a shared-library permission model:
-#   artifacts : <ARTIFACTS_USER>:<group>  mode 2775  (setgid, group-writable)
-#   cache     : <group-user>:<group>      mode 2770  (setgid, group-writable)
-#   staging   : <group-user>:<group>      mode 2770
-#   pool-root : <ARTIFACTS_USER>:<group>  mode 2775
-# setgid (the leading 2) makes new files/dirs inherit the group, so any member
-# of the group can publish into the shared library and the group stays correct.
-# NOTE: with group-write, artifact immutability (spec 7.4) is NOT enforced by
-# the filesystem — it relies on the import workflow (staging + atomic rename).
-OWNER_GROUP=""                 # e.g. revolver
-ARTIFACTS_USER="root"          # owner user for artifacts/pool-root
-CACHE_USER=""                  # owner user for cache/staging (defaults to group name)
+BASE_PATH=""
+OWNER_GROUP=""
 
 usage() {
-    sed -n '2,30p' "$0"
+    sed -n '2,38p' "$0"
     exit "${1:-0}"
 }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --rootless) PROFILE="rootless"; PROFILE_EXPLICIT=1 ;;
-        --system)   PROFILE="system";   PROFILE_EXPLICIT=1 ;;
-        --prefix)   PREFIX="${2:?--prefix needs a path}"; shift ;;
-        --example)  MAKE_EXAMPLE=1 ;;
-        --owner)    OWNER_GROUP="${2:?--owner needs a group name}"; shift ;;
-        --artifacts-user) ARTIFACTS_USER="${2:?--artifacts-user needs a user}"; shift ;;
-        --cache-user)     CACHE_USER="${2:?--cache-user needs a user}"; shift ;;
-        -h|--help)  usage 0 ;;
+        --path)  BASE_PATH="${2:?--path needs a directory}"; shift ;;
+        --owner) OWNER_GROUP="${2:?--owner needs a group (GID or name)}"; shift ;;
+        -h|--help) usage 0 ;;
         *) echo "Unknown argument: $1" >&2; usage 1 ;;
     esac
     shift
 done
 
-# --owner describes a shared, group-managed library, which is a system-managed
-# scenario rather than a per-user rootless one. If the user did not pick a
-# profile explicitly, --owner implies the 'system' profile.
-if [[ -n "$OWNER_GROUP" && "$PROFILE_EXPLICIT" -eq 0 ]]; then
-    PROFILE="system"
+if [[ -z "$BASE_PATH" ]]; then
+    echo "Error: --path is required." >&2
+    usage 1
+fi
+
+# Normalize: strip trailing slash (but keep root "/" intact).
+if [[ "$BASE_PATH" != "/" ]]; then
+    BASE_PATH="${BASE_PATH%/}"
 fi
 
 # ---------------------------------------------------------------------------
-# Resolve the four roots (env override > profile default)
+# Derive the four roots from the single base path
 # ---------------------------------------------------------------------------
-if [[ "$PROFILE" == "system" ]]; then
-    : "${POOL_ROOT:=/srv/llm-pool}"
-    : "${ARTIFACTS_ROOT:=/usr/share/llm-pool/artifacts}"
-    : "${CACHE_ROOT:=/var/cache/${PRODUCT}/llm-pool}"
-    : "${STAGING_ROOT:=/var/lib/${PRODUCT}/llm-pool/staging}"
-else
-    BASE="$HOME"
-    : "${POOL_ROOT:=${BASE}/.local/share/llm-pool}"
-    : "${ARTIFACTS_ROOT:=${BASE}/.local/share/llm-pool/artifacts}"
-    : "${CACHE_ROOT:=${BASE}/.cache/llm-pool}"
-    : "${STAGING_ROOT:=${BASE}/.local/state/llm-pool/staging}"
-fi
+POOL_ROOT="$BASE_PATH"
+ARTIFACTS_ROOT="${BASE_PATH}/artifacts"
+CACHE_ROOT="${BASE_PATH}/cache"
+STAGING_ROOT="${BASE_PATH}/staging"
 
-# Apply an optional sandbox prefix so the script can be tested without touching
-# real system paths. Absolute roots are appended verbatim under the prefix.
-apply_prefix() {
-    local p="$1"
-    if [[ -n "$PREFIX" ]]; then
-        printf '%s/%s' "${PREFIX%/}" "${p#/}"
-    else
-        printf '%s' "$p"
-    fi
-}
+# Artifact-format families (format-first taxonomy; never runtime names).
+FORMATS=(gguf safetensors awq gptq mlx onnx)
 
-POOL_ROOT="$(apply_prefix "$POOL_ROOT")"
-ARTIFACTS_ROOT="$(apply_prefix "$ARTIFACTS_ROOT")"
-CACHE_ROOT="$(apply_prefix "$CACHE_ROOT")"
-STAGING_ROOT="$(apply_prefix "$STAGING_ROOT")"
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 mkdir_v() { mkdir -p "$1" && echo "  + $1"; }
 
-# Recognized artifact-format families (format-first top-level taxonomy).
-# Runtime names (vllm, llama.cpp, ...) are deliberately NOT used here.
-FORMATS=(gguf safetensors awq gptq mlx onnx)
+# ---------------------------------------------------------------------------
+# Validate --owner (group must exist) before creating anything
+# ---------------------------------------------------------------------------
+if [[ -n "$OWNER_GROUP" ]]; then
+    if ! getent group "$OWNER_GROUP" >/dev/null 2>&1; then
+        echo "Error: group '$OWNER_GROUP' does not exist (checked with getent)." >&2
+        exit 1
+    fi
+fi
 
 # ---------------------------------------------------------------------------
 # Build the tree
 # ---------------------------------------------------------------------------
-echo "pool_layout_v1 — profile: ${PROFILE}${PREFIX:+ (prefix: $PREFIX)}"
+echo "pool_layout_v1 — base path: ${POOL_ROOT}"
 echo
 
 echo "pool-root:"
@@ -140,99 +114,39 @@ mkdir_v "$STAGING_ROOT"
 mkdir_v "${STAGING_ROOT}/jobs"
 
 # ---------------------------------------------------------------------------
-# Permissions per spec section 11.
-# Two modes:
-#   (a) no --owner: simple single-owner model
-#       artifacts world-readable/owner-writable, cache+staging owner-only.
-#   (b) --owner GROUP: shared-library model with setgid so group members can
-#       publish, and new files inherit the group.
+# Permissions (spec section 11)
 # ---------------------------------------------------------------------------
 if [[ -n "$OWNER_GROUP" ]]; then
-    : "${CACHE_USER:=$OWNER_GROUP}"   # default cache/staging user = group name
-
-    # setgid (leading 2) → inherit group on new files/dirs
+    # setgid (leading 2) → new files/dirs inherit the group
     chmod 2775 "$POOL_ROOT"
     chmod -R 2775 "$ARTIFACTS_ROOT"
     chmod 2770 "$CACHE_ROOT"
     chmod 2770 "$STAGING_ROOT"
     chmod 2770 "${STAGING_ROOT}/jobs"
 
-    if [[ -z "$PREFIX" && "$(id -u)" -eq 0 ]]; then
-        chown    "${ARTIFACTS_USER}:${OWNER_GROUP}" "$POOL_ROOT"
-        chown -R "${ARTIFACTS_USER}:${OWNER_GROUP}" "$ARTIFACTS_ROOT"
-        chown    "${CACHE_USER}:${OWNER_GROUP}"     "$CACHE_ROOT"
-        chown -R "${CACHE_USER}:${OWNER_GROUP}"     "$STAGING_ROOT"
+    if [[ "$(id -u)" -eq 0 ]]; then
+        # artifacts / pool-root: owned by root, group = OWNER_GROUP
+        chown    "root:${OWNER_GROUP}" "$POOL_ROOT"
+        chown -R "root:${OWNER_GROUP}" "$ARTIFACTS_ROOT"
+        # cache / staging: group-owned working areas (owner left as current root)
+        chown -R ":${OWNER_GROUP}" "$CACHE_ROOT"
+        chown -R ":${OWNER_GROUP}" "$STAGING_ROOT"
         echo
-        echo "Ownership applied:"
-        printf '  %-15s %s\n' "artifacts" "${ARTIFACTS_USER}:${OWNER_GROUP} (2775, setgid)"
-        printf '  %-15s %s\n' "cache"     "${CACHE_USER}:${OWNER_GROUP} (2770, setgid)"
-        printf '  %-15s %s\n' "staging"   "${CACHE_USER}:${OWNER_GROUP} (2770, setgid)"
+        echo "Ownership applied (group: ${OWNER_GROUP}):"
+        printf '  %-15s %s\n' "artifacts" "root:${OWNER_GROUP} (2775, setgid)"
+        printf '  %-15s %s\n' "cache"     ":${OWNER_GROUP} (2770, setgid)"
+        printf '  %-15s %s\n' "staging"   ":${OWNER_GROUP} (2770, setgid)"
     else
         echo
-        echo "NOTE: chown skipped (need root, and not in --prefix sandbox)."
-        echo "      Run the following as root to set ownership:"
-        echo "        chown -R ${ARTIFACTS_USER}:${OWNER_GROUP} ${POOL_ROOT} ${ARTIFACTS_ROOT}"
-        echo "        chown -R ${CACHE_USER}:${OWNER_GROUP} ${CACHE_ROOT} ${STAGING_ROOT}"
+        echo "NOTE: not running as root — modes set, but chown skipped."
+        echo "      Run as root to assign group ownership:"
+        echo "        chown -R root:${OWNER_GROUP} ${POOL_ROOT} ${ARTIFACTS_ROOT}"
+        echo "        chown -R :${OWNER_GROUP} ${CACHE_ROOT} ${STAGING_ROOT}"
     fi
 else
     chmod 0755 "$ARTIFACTS_ROOT"
     chmod 0700 "$CACHE_ROOT"
     chmod 0700 "$STAGING_ROOT"
-fi
-
-# ---------------------------------------------------------------------------
-# Optional: populate the minimal example from section 13
-# ---------------------------------------------------------------------------
-if [[ "$MAKE_EXAMPLE" -eq 1 ]]; then
-    echo
-    echo "Creating minimal example payload directories:"
-
-    gguf_model="${ARTIFACTS_ROOT}/gguf/bartowski/llama-3.1-8b-instruct-gguf"
-    st_model="${ARTIFACTS_ROOT}/safetensors/qwen/qwen3-8b-instruct"
-
-    mkdir_v "$gguf_model"
-    mkdir_v "$st_model"
-
-    # Placeholder payload files (empty) just to materialize the shape.
-    : > "${gguf_model}/Q4_K_M.gguf"
-    : > "${gguf_model}/Q8_0.gguf"
-    : > "${st_model}/config.json"
-    : > "${st_model}/tokenizer.json"
-    : > "${st_model}/model-00001-of-00002.safetensors"
-    : > "${st_model}/model-00002-of-00002.safetensors"
-
-    # _pool.json metadata (section 5.2 fields)
-    cat > "${gguf_model}/_pool.json" <<'JSON'
-{
-  "layout_version": "pool_layout_v1",
-  "format": "gguf",
-  "publisher": "bartowski",
-  "model": "llama-3.1-8b-instruct-gguf",
-  "upstream_id": "bartowski/Llama-3.1-8B-Instruct-GGUF",
-  "source": "",
-  "files": ["Q4_K_M.gguf", "Q8_0.gguf"],
-  "checksums": {}
-}
-JSON
-
-    cat > "${st_model}/_pool.json" <<'JSON'
-{
-  "layout_version": "pool_layout_v1",
-  "format": "safetensors",
-  "publisher": "qwen",
-  "model": "qwen3-8b-instruct",
-  "upstream_id": "Qwen/Qwen3-8B-Instruct",
-  "source": "",
-  "files": [
-    "config.json",
-    "tokenizer.json",
-    "model-00001-of-00002.safetensors",
-    "model-00002-of-00002.safetensors"
-  ],
-  "checksums": {}
-}
-JSON
-    echo "  + example _pool.json metadata written"
 fi
 
 # ---------------------------------------------------------------------------
@@ -249,3 +163,4 @@ if command -v tree >/dev/null 2>&1; then
     echo
     tree -a "$POOL_ROOT" 2>/dev/null || true
 fi
+
