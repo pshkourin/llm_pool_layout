@@ -1,0 +1,5 @@
+sudo POOL_ROOT=/opt/revolver \
+  ARTIFACTS_ROOT=/opt/revolver/artifacts \
+  CACHE_ROOT=/opt/revolver/cache \
+  STAGING_ROOT=/opt/revolver/staging \
+  bash init_pool_layout.sh --owner revolver
