@@ -52,10 +52,23 @@ sudo POOL_ROOT=/opt/revolver \
 | `--system` | System-managed defaults (`/srv`, `/usr/share`, `/var/cache`, `/var/lib`) |
 | `--prefix PATH` | Prepend a sandbox prefix to every root (for testing; skips `chown`) |
 | `--example` | Also create the minimal example payloads + `_pool.json` metadata |
-| `--owner GROUP` | Apply the shared-library permission model (setgid, group-writable) |
+| `--owner GROUP` | Apply the shared-library permission model (setgid, group-writable). **Implies `--system` unless a profile is set explicitly.** |
 | `--artifacts-user USER` | Owner user for `artifacts`/`pool-root` (default `root`) |
 | `--cache-user USER` | Owner user for `cache`/`staging` (default = group name) |
 | `-h`, `--help` | Show usage |
+
+### Profile selection
+
+The profile decides the default paths. It resolves in this order:
+
+1. An explicit `--rootless` / `--system` flag always wins.
+2. Otherwise, `--owner GROUP` implies `--system` (a shared group library is a
+   system-managed scenario, not a per-user one).
+3. Otherwise, the default is `rootless`.
+
+In all cases the `*_ROOT` environment variables override the profile's paths,
+so if you pass explicit roots the profile only affects the banner, not the
+locations.
 
 ## Environment overrides (win over the profile)
 
