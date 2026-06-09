@@ -1,0 +1,382 @@
+# pool_layout_v1
+
+Status: Draft
+Version: 1.0
+Language: English
+Audience: developers, packagers, operators, runtime integrators
+
+## 1. Scope
+
+This specification defines a shared filesystem layout for LLM model pools used by multiple runtimes on the same host.
+
+The layout is:
+- format-first, not runtime-first;
+- safe for rootless deployments;
+- compatible with shared read-only model storage plus writable runtime caches;
+- stable enough to be adopted across products and teams.
+
+This specification does not define:
+- runtime-specific CLI arguments;
+- network registry APIs;
+- cache eviction policy;
+- model selection policy.
+
+## 2. Terms
+
+### 2.1 pool-root
+`pool-root` is the administrative root of one pool deployment.
+
+It defines the trust boundary for path resolution and groups the roots that belong to the same model pool instance.
+
+`pool-root` may be a real directory, or a logical umbrella for several configured absolute paths.
+
+### 2.2 artifacts-root
+`artifacts-root` is the canonical storage root for published LLM artifacts.
+
+Files under `artifacts-root` are durable, shareable, and intended to be mounted read-only into runtimes whenever possible.
+
+`artifacts-root` is the only root that contains published model payloads.
+
+### 2.3 cache-root
+`cache-root` is the writable root for disposable runtime-generated data.
+
+Files under `cache-root` are not canonical artifacts and may be deleted, rebuilt, or evicted at any time.
+
+A runtime must remain functional after cache loss, except for the cost of regeneration.
+
+### 2.4 staging-root
+`staging-root` is the writable root for downloads, uploads, validation, conversion, and import jobs before publication.
+
+Files under `staging-root` are temporary and must not be treated as published artifacts.
+
+A failed or interrupted import must leave data in `staging-root`, not in `artifacts-root`.
+
+## 3. Root placement
+
+### 3.1 Generic rule
+The following roots must be configurable independently:
+- `pool-root`
+- `artifacts-root`
+- `cache-root`
+- `staging-root`
+
+They may be nested or separate.
+
+### 3.2 Recommended rootless defaults
+Example for a service account:
+
+- `pool-root`: `/home/<svc>/.local/share/llm-pool`
+- `artifacts-root`: `/home/<svc>/.local/share/llm-pool/artifacts`
+- `cache-root`: `/home/<svc>/.cache/llm-pool`
+- `staging-root`: `/home/<svc>/.local/state/llm-pool/staging`
+
+### 3.3 Recommended system-managed defaults
+Example for a host-managed deployment:
+
+- `pool-root`: `/srv/llm-pool`
+- `artifacts-root`: `/usr/share/llm-pool/artifacts`
+- `cache-root`: `/var/cache/<product>/llm-pool`
+- `staging-root`: `/var/lib/<product>/llm-pool/staging`
+
+### 3.4 Mounting rule
+Containers and runtimes should normally receive:
+- `artifacts-root` as read-only;
+- `cache-root` as read-write;
+- `staging-root` only for services that perform imports or conversions.
+
+## 4. Canonical artifact layout
+
+### 4.1 Path contract
+Published artifacts must use this canonical path shape:
+
+`<artifacts-root>/<format>/<publisher>/<model>/<file>`
+
+Examples:
+
+- `/usr/share/llm-pool/artifacts/gguf/bartowski/llama-3.1-8b-instruct-gguf/Q4_K_M.gguf`
+- `/usr/share/llm-pool/artifacts/safetensors/qwen/qwen3-8b-instruct/model-00001-of-00002.safetensors`
+
+### 4.2 Path meaning
+- `format`: artifact family, such as `gguf` or `safetensors`
+- `publisher`: upstream namespace, author, or organization
+- `model`: upstream model/repository name
+- `file`: upstream payload file or associated sidecar file
+
+### 4.3 Format-first rule
+The top-level taxonomy under `artifacts-root` must be based on artifact format, not runtime name.
+
+Examples of valid first-level directories:
+- `gguf/`
+- `safetensors/`
+- `awq/`
+- `gptq/`
+- `mlx/`
+- `onnx/`
+
+Directories such as `vllm/`, `llama.cpp/`, or `ik_llama.cpp/` must not be used as the primary storage taxonomy.
+
+### 4.4 Model directory rule
+All published files that belong to one upstream model identity must live in the same model directory.
+
+For example, multiple GGUF quantizations of the same upstream model should be grouped together:
+
+`<artifacts-root>/gguf/<publisher>/<model>/`
+
+This keeps model identity stable while allowing multiple payload files.
+
+## 5. Naming and normalization
+
+### 5.1 On-disk normalization
+The on-disk values for `publisher` and `model` should be normalized for portability.
+
+Recommended normalization:
+- lowercase ASCII;
+- allowed characters: `a-z`, `0-9`, `.`, `_`, `-`;
+- path separators are not allowed inside a single path segment;
+- whitespace should be converted to `-`;
+- characters outside the allowed set should be replaced conservatively.
+
+### 5.2 Upstream identity preservation
+If normalization changes the original upstream identifier, the exact upstream identifier should be preserved in metadata.
+
+Recommended metadata file:
+- `_pool.json`
+
+Recommended fields:
+- `layout_version`
+- `format`
+- `publisher`
+- `model`
+- `upstream_id`
+- `source`
+- `files`
+- `checksums`
+
+### 5.3 Reserved filenames
+The following names are reserved for pool metadata and operational use:
+- `_pool.json`
+- `_checksums.txt`
+- `_import.json`
+- `_locks/` (optional, implementation-specific)
+
+Applications should not use these names for upstream payload files.
+
+## 6. Artifact classes
+
+### 6.1 Canonical artifacts
+Canonical artifacts are durable files that belong to the published model payload.
+
+Examples:
+- `.gguf`
+- `.safetensors`
+- `config.json`
+- `tokenizer.json`
+- `tokenizer.model`
+- `generation_config.json`
+- checksum and manifest files
+
+Canonical artifacts must live only under `artifacts-root`.
+
+### 6.2 Cache content
+Cache content is derived or disposable runtime data.
+
+Examples:
+- prompt caches;
+- compiled kernels;
+- mmap indices;
+- temporary merged outputs not yet published;
+- runtime download caches;
+- scheduler state;
+- engine-specific local accelerators.
+
+Cache content must live only under `cache-root`.
+
+### 6.3 Staging content
+Staging content is unpublished working data.
+
+Examples:
+- active downloads;
+- uploaded files pending validation;
+- conversion outputs pending verification;
+- temporary import manifests;
+- job work directories.
+
+Staging content must live only under `staging-root`.
+
+## 7. Import and publication
+
+### 7.1 Import rule
+A model import must never write directly into its final published location.
+
+All imports must first land in a job-scoped directory under `staging-root`.
+
+Recommended path:
+
+`<staging-root>/jobs/<job-id>/`
+
+### 7.2 Import steps
+A compliant import flow should follow these steps:
+
+1. Create a unique staging job directory.
+2. Place incoming files into staging.
+3. Validate structure, filenames, size, and checksums when available.
+4. Derive the canonical destination path.
+5. Publish atomically into `artifacts-root`.
+6. Write or update metadata only after successful publication.
+7. Mark the job complete and clean staging leftovers.
+
+### 7.3 Atomic publication
+Publication into `artifacts-root` must be atomic from the reader’s point of view.
+
+Preferred methods:
+- `rename()` within the same filesystem;
+- otherwise copy to a temporary destination, `fsync`, verify, then final `rename()`.
+
+A reader must never observe a partially published model directory as complete.
+
+### 7.4 In-place mutation
+Published artifacts must be treated as immutable.
+
+Implementations must not:
+- append to published files;
+- rewrite bytes in place;
+- replace a published file with different content under the same identity without explicit versioning or checksum verification.
+
+## 8. Symlink rules
+
+### 8.1 Allowed use
+Symlinks may be used for controlled aliasing and deduplication.
+
+They are optional, not required.
+
+### 8.2 Safety rule
+Symlink targets must resolve inside the configured pool trust boundary.
+
+Recommended minimum rule:
+- symlinks published under `artifacts-root` must resolve to paths inside `artifacts-root`.
+
+Symlinks must not resolve into:
+- `cache-root`
+- `staging-root`
+- unrelated host paths
+
+### 8.3 Relative symlink rule
+Relative symlinks should be preferred over absolute symlinks.
+
+Relative symlinks are more portable across host migrations, bind mounts, and container mounts.
+
+### 8.4 Directory symlink rule
+Directory symlinks should not be used for canonical model directories.
+
+If symlinks are used, file-level symlinks are preferred.
+
+### 8.5 Reader behavior
+Consumers should resolve symlinks before use and reject any path that escapes the configured trust boundary.
+
+This rule applies even if the host filesystem would otherwise permit traversal.
+
+## 9. Hardlink rules
+
+### 9.1 Allowed use
+Hardlinks may be used for deduplication when source and destination are on the same filesystem.
+
+They are especially useful when importing identical payloads from staging into artifacts.
+
+### 9.2 Publication rule
+A hardlinked file published into `artifacts-root` must be treated as immutable.
+
+Any workflow that requires later modification must copy the file first.
+
+### 9.3 Forbidden sources
+Hardlinks from `cache-root` into `artifacts-root` are not allowed.
+
+Hardlinks from temporary or unsafe locations into `artifacts-root` are not allowed.
+
+### 9.4 Cross-filesystem fallback
+If a hardlink cannot be created because the source and destination are on different filesystems, the implementation must fall back to copy-based publication.
+
+### 9.5 Ownership and permissions
+Hardlinks must not be used to bypass ownership, permission, or policy boundaries.
+
+The published file must end up readable by its intended consumers under the final policy.
+
+## 10. Import mode policy
+
+### 10.1 Supported import modes
+An implementation may support:
+- copy import;
+- hardlink import;
+- symlink import.
+
+### 10.2 Default mode
+The default import mode should be:
+1. hardlink, if safe and same-filesystem;
+2. otherwise copy.
+
+Symlink import should be opt-in and disabled by default for shared or system-managed pools.
+
+### 10.3 Import mode semantics
+- `copy`: creates an independent published file
+- `hardlink`: publishes the same inode under the canonical path
+- `symlink`: publishes an alias to another file path
+
+The import mode must be recorded in `_import.json` or equivalent metadata.
+
+## 11. Permissions and mutability
+
+### 11.1 Published content
+Published artifacts should be readable by all intended consumers and writable only by trusted importers or pool administrators.
+
+### 11.2 Runtime behavior
+Runtimes must not assume they can write into `artifacts-root`.
+
+Any writable runtime state belongs in `cache-root`.
+
+### 11.3 Cleanup
+Implementations may clean:
+- `cache-root` at any time;
+- stale jobs in `staging-root` according to policy.
+
+Implementations must not delete published artifacts from `artifacts-root` as part of ordinary cache cleanup.
+
+## 12. Compliance summary
+
+A layout is compliant with `pool_layout_v1` if all of the following are true:
+
+- published model payloads live under `artifacts-root`;
+- the canonical artifact path is format-first;
+- the primary taxonomy is not based on runtime names;
+- `cache-root` contains only disposable runtime data;
+- `staging-root` contains only unpublished job data;
+- publication is atomic;
+- published artifacts are immutable;
+- symlinks do not escape the trust boundary;
+- hardlinks are used only under safe immutability rules.
+
+## 13. Minimal example
+
+```text
+/usr/share/llm-pool/
+└── artifacts/
+    ├── gguf/
+    │   └── bartowski/
+    │       └── llama-3.1-8b-instruct-gguf/
+    │           ├── Q4_K_M.gguf
+    │           ├── Q8_0.gguf
+    │           └── _pool.json
+    └── safetensors/
+        └── qwen/
+            └── qwen3-8b-instruct/
+                ├── config.json
+                ├── tokenizer.json
+                ├── model-00001-of-00002.safetensors
+                ├── model-00002-of-00002.safetensors
+                └── _pool.json
+
+/var/cache/<product>/llm-pool/
+└── ...
+
+/var/lib/<product>/llm-pool/staging/
+└── jobs/
+    └── <job-id>/
+```
