@@ -29,6 +29,7 @@ set -euo pipefail
 # Defaults / argument parsing
 # ---------------------------------------------------------------------------
 PROFILE="rootless"     # rootless | system
+PROFILE_EXPLICIT=0     # set to 1 when --rootless/--system is passed explicitly
 PREFIX=""              # optional sandbox prefix prepended to every root
 MAKE_EXAMPLE=0
 PRODUCT="${PRODUCT:-myproduct}"
@@ -55,8 +56,8 @@ usage() {
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --rootless) PROFILE="rootless" ;;
-        --system)   PROFILE="system" ;;
+        --rootless) PROFILE="rootless"; PROFILE_EXPLICIT=1 ;;
+        --system)   PROFILE="system";   PROFILE_EXPLICIT=1 ;;
         --prefix)   PREFIX="${2:?--prefix needs a path}"; shift ;;
         --example)  MAKE_EXAMPLE=1 ;;
         --owner)    OWNER_GROUP="${2:?--owner needs a group name}"; shift ;;
@@ -67,6 +68,13 @@ while [[ $# -gt 0 ]]; do
     esac
     shift
 done
+
+# --owner describes a shared, group-managed library, which is a system-managed
+# scenario rather than a per-user rootless one. If the user did not pick a
+# profile explicitly, --owner implies the 'system' profile.
+if [[ -n "$OWNER_GROUP" && "$PROFILE_EXPLICIT" -eq 0 ]]; then
+    PROFILE="system"
+fi
 
 # ---------------------------------------------------------------------------
 # Resolve the four roots (env override > profile default)
