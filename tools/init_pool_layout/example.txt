@@ -1,5 +1,0 @@
-# export POOL_ROOT=/opt/revolver
-# export ARTIFACTS_ROOT=/opt/revolver/artifacts
-# export CACHE_ROOT=/opt/revolver/cache
-# export STAGING_ROOT=/opt/revolver/staging
-# bash init_pool_layout.sh --owner revolver
